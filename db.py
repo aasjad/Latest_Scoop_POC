@@ -1,0 +1,549 @@
+"""
+db.py
+-----
+
+Database layer for the Incident Management System.
+
+Responsibility of this file:
+    - Connect to SQLite database
+    - Create the incidents table
+    - Insert incidents
+    - Retrieve incidents
+    - Update incidents
+    - Delete incidents
+    - Count incidents
+
+The frontend will NOT directly access this file.
+
+The flow will be:
+
+    Frontend
+        ↓
+    FastAPI Backend
+        ↓
+    db.py
+        ↓
+    SQLite Database
+"""
+
+
+import os
+import sqlite3
+from pathlib import Path
+
+
+# ============================================================
+# DATABASE CONFIGURATION
+# ============================================================
+
+# Project root (the folder containing this file). Paths are anchored here so
+# the database is the same file no matter which folder a server is started from.
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Actual SQLite database file: <project>/DB/incidents.db by default.
+# Override with the INCIDENTS_DB_PATH environment variable.
+DATABASE_PATH = Path(os.getenv("INCIDENTS_DB_PATH", PROJECT_ROOT / "DB" / "incidents.db"))
+
+
+def set_database_path(path):
+    """Point every function in this module at a different SQLite file.
+
+    The backend calls this at startup with its configured path (tests use a
+    temporary file).
+    """
+
+    global DATABASE_PATH
+    DATABASE_PATH = Path(path)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_connection():
+    """
+    Create and return a connection to the SQLite database.
+
+    Every database operation will use this connection.
+
+    check_same_thread=False:
+        Useful when the backend (for example FastAPI) handles
+        requests using different threads.
+    """
+
+    # Create the database folder if it doesn't already exist.
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Connect to SQLite database.
+    connection = sqlite3.connect(
+        DATABASE_PATH,
+        check_same_thread=False,
+        timeout=10
+    )
+
+    # This allows us to access columns by name instead of
+    # only using indexes.
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+# ============================================================
+# CREATE TABLE
+# ============================================================
+
+def create_table():
+    """
+    Create the incidents table if it does not already exist.
+
+    This function should be called when the backend starts.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS incidents (
+
+            -- Unique ID for every incident
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            -- Camera from which the incident came
+            camera_id TEXT NOT NULL,
+
+            -- ID assigned to the detected person
+            person_id INTEGER,
+
+            -- Type of event
+            -- Example: ZONE_INTRUSION, LINE_CROSSING
+            event_type TEXT NOT NULL,
+
+            -- Severity of the incident
+            -- Example: LOW, MEDIUM, HIGH, CRITICAL
+            severity TEXT NOT NULL,
+
+            -- Human-readable description
+            description TEXT,
+
+            -- Time when the incident happened
+            timestamp TEXT NOT NULL,
+
+            -- Path of the saved incident image
+            image_path TEXT,
+
+            -- Incident status
+            -- Example: OPEN, REVIEWED, RESOLVED
+            status TEXT DEFAULT 'OPEN',
+
+            -- Time when the database record was created (UTC, ISO 8601,
+            -- same format as timestamp so the frontend parses both alike)
+            created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
+
+    # Save changes.
+    connection.commit()
+
+    # Close connection.
+    connection.close()
+
+
+# ============================================================
+# CREATE / INSERT
+# ============================================================
+
+def create_incident(
+    camera_id,
+    person_id,
+    event_type,
+    severity,
+    description,
+    timestamp,
+    image_path
+):
+    """
+    Insert a new incident into the database.
+
+    This will normally be called by your backend when the
+    AI/event detection system detects an incident.
+
+    Returns:
+        ID of the newly created incident.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO incidents (
+            camera_id,
+            person_id,
+            event_type,
+            severity,
+            description,
+            timestamp,
+            image_path
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        camera_id,
+        person_id,
+        event_type,
+        severity,
+        description,
+        timestamp,
+        image_path
+    ))
+
+    # Save INSERT operation.
+    connection.commit()
+
+    # Get the ID automatically generated by SQLite.
+    incident_id = cursor.lastrowid
+
+    connection.close()
+
+    return incident_id
+
+
+# ============================================================
+# READ / RETRIEVE ALL INCIDENTS
+# ============================================================
+
+def get_all_incidents():
+    """
+    Retrieve all incidents from the database.
+
+    This can be used when the frontend wants to display
+    an incident list/table.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        ORDER BY timestamp DESC, id DESC
+    """)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    # Convert SQLite Row objects into normal dictionaries.
+    return [dict(row) for row in rows]
+
+
+# ============================================================
+# READ / RETRIEVE ONE INCIDENT
+# ============================================================
+
+def get_incident_by_id(incident_id):
+    """
+    Retrieve one incident using its ID.
+
+    Example:
+        Frontend requests incident 25
+        ↓
+        Backend calls get_incident_by_id(25)
+        ↓
+        Database returns incident 25
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        WHERE id = ?
+    """, (incident_id,))
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    # If no incident exists with this ID,
+    # return None.
+    if row is None:
+        return None
+
+    return dict(row)
+
+
+# ============================================================
+# FILTER INCIDENTS
+# ============================================================
+
+def _build_filters(camera_id=None, severity=None, event_type=None, status=None):
+    """Build the WHERE clause shared by get_incidents() and the counts."""
+
+    query = " WHERE 1=1"
+    parameters = []
+
+    # Add camera filter if provided.
+    if camera_id is not None:
+        query += " AND camera_id = ?"
+        parameters.append(camera_id)
+
+    # Add severity filter if provided.
+    if severity is not None:
+        query += " AND severity = ?"
+        parameters.append(severity)
+
+    # Add event type filter if provided.
+    if event_type is not None:
+        query += " AND event_type = ?"
+        parameters.append(event_type)
+
+    # Add status filter if provided.
+    if status is not None:
+        query += " AND status = ?"
+        parameters.append(status)
+
+    return query, parameters
+
+
+def get_incidents(
+    camera_id=None,
+    severity=None,
+    event_type=None,
+    status=None,
+    limit=None,
+    offset=0
+):
+    """
+    Retrieve incidents using optional filters.
+
+    Example frontend filters:
+
+        /incidents?severity=CRITICAL
+
+        /incidents?camera_id=CAM_01
+
+        /incidents?status=OPEN
+
+    Any combination of filters can be used. limit/offset page through
+    the results; limit=None returns everything.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    where, parameters = _build_filters(camera_id, severity, event_type, status)
+
+    # Newest incidents first; id breaks ties within the same second.
+    query = "SELECT * FROM incidents" + where + " ORDER BY timestamp DESC, id DESC"
+
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        parameters += [limit, offset]
+
+    cursor.execute(query, parameters)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+# ============================================================
+# UPDATE INCIDENT
+# ============================================================
+
+def update_incident(
+    incident_id,
+    status=None,
+    severity=None,
+    description=None
+):
+    """
+    Update an existing incident.
+
+    Currently the frontend/backend can update:
+
+        - status
+        - severity
+        - description
+
+    Example:
+
+        Incident 25:
+            status = OPEN
+
+        Frontend changes it to:
+
+            status = RESOLVED
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    # Store fields that need to be updated.
+    fields = []
+    values = []
+
+    if status is not None:
+        fields.append("status = ?")
+        values.append(status)
+
+    if severity is not None:
+        fields.append("severity = ?")
+        values.append(severity)
+
+    if description is not None:
+        fields.append("description = ?")
+        values.append(description)
+
+    # If nothing was provided to update,
+    # there is nothing to do.
+    if not fields:
+        connection.close()
+        return False
+
+    # Add incident ID at the end of parameters.
+    values.append(incident_id)
+
+    # Build UPDATE query.
+    query = f"""
+        UPDATE incidents
+        SET {", ".join(fields)}
+        WHERE id = ?
+    """
+
+    cursor.execute(query, values)
+
+    # Save changes.
+    connection.commit()
+
+    # Check whether a row was actually updated.
+    updated = cursor.rowcount > 0
+
+    connection.close()
+
+    return updated
+
+
+# ============================================================
+# DELETE INCIDENT
+# ============================================================
+
+def delete_incident(incident_id):
+    """
+    Delete one incident from the database.
+
+    Example:
+
+        Frontend
+            ↓
+        DELETE /incidents/25
+            ↓
+        Backend
+            ↓
+        delete_incident(25)
+            ↓
+        SQLite removes incident 25
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        DELETE FROM incidents
+        WHERE id = ?
+    """, (incident_id,))
+
+    # Save DELETE operation.
+    connection.commit()
+
+    # Check whether an incident was deleted.
+    deleted = cursor.rowcount > 0
+
+    connection.close()
+
+    return deleted
+
+
+# ============================================================
+# COUNT INCIDENTS
+# ============================================================
+
+def get_incident_count(
+    severity=None,
+    status=None,
+    camera_id=None,
+    event_type=None
+):
+    """
+    Return the number of incidents.
+
+    Examples:
+
+        Total incidents
+        Critical incidents
+        Open incidents
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    where, parameters = _build_filters(camera_id, severity, event_type, status)
+
+    cursor.execute("SELECT COUNT(*) FROM incidents" + where, parameters)
+
+    count = cursor.fetchone()[0]
+
+    connection.close()
+
+    return count
+
+
+def get_incident_breakdown(
+    column,
+    camera_id=None,
+    severity=None,
+    event_type=None,
+    status=None
+):
+    """
+    Count incidents per value of one column, e.g. per severity:
+
+        {"CRITICAL": 2, "LOW": 7}
+
+    Used by the dashboard statistics.
+    """
+
+    # The column name goes into the SQL text, so only allow known columns.
+    if column not in ("severity", "status", "event_type", "camera_id"):
+        raise ValueError(f"Cannot group incidents by {column!r}")
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    where, parameters = _build_filters(camera_id, severity, event_type, status)
+
+    cursor.execute(
+        f"SELECT {column}, COUNT(*) FROM incidents{where} GROUP BY {column}",
+        parameters
+    )
+
+    breakdown = {value: count for value, count in cursor.fetchall()}
+
+    connection.close()
+
+    return breakdown
+
+
+# ============================================================
+# TEST / INITIALIZATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    # Create database and table.
+    create_table()
+
+    print("SQLite database initialized successfully.")
+    print(f"Database location: {DATABASE_PATH}")

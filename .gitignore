@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated incident data
+incidents/images/
+incidents/
+
+# YOLO/model files
+*.pt
+*.onnx
+*.engine
+*.xml
+*.bin
+
+# Node
+node_modules/
+Frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
